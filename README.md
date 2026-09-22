@@ -25,6 +25,8 @@
 
 以及 **周期结转额度试算** 接口 `POST /rollover-simulate`：给定多个由 `anchor`（周期锚点）、`period_seconds`（周期长度）、`allowance`（每期基础额度）与 `carry_cap`（结转上限）定义的周期结转策略，以及按时间排序、携带 `cost` / `policy_refs` 的请求序列。跨期时**旧结转额一律失效**，上一周期未用的基础额度结转到新周期（成为该周期的结转余额，不超过 `carry_cap`），新周期基础额度重置为满额；消费时**先扣即将失效的结转余额**、再扣本期基础额度。仅当请求引用的**全部**策略两类余额合计都足够时才**原子扣减**，否则**所有策略保持不变**并返回 `policy_refs` 顺序上**首个余额不足策略**。响应按原始输入顺序给出各引用策略的周期编号与周期区间、两类余额扣减前后快照、拒绝原因明细，并返回各策略在最后请求时刻的**终态**（周期/基础额度/结转额）。
 
+以及 **可借贷令牌桶试算** 接口 `POST /debt-simulate`：桶在 `/simulate` 的 `capacity` / `refill_rate` / `initial` 之外增加 `debt_limit`（累计债务上限）。每次判定先做连续补充，**补充的令牌先偿还债务**、还清后的剩余才进入可用余额（封顶 `capacity`）；余额不足时允许**借入缺口**（扣减后余额为 0、累计债务增加），但累计债务不得超过 `debt_limit`；`cost > capacity + debt_limit` 的请求对该桶**永远不可达**（即使满桶零债也支付不起）。链上任一桶无法在借贷上限内满足成本即**整笔原子拒绝**，链上所有桶的余额与债务保持不变。响应按原始索引返回 `allowed`、每桶 before/after 的 `balance` 与 `debt`、`rejected_by` 与拒绝原因明细（`debt_limit_exceeded` / `cost_exceeds_capacity`），并给出各桶在最后请求时刻的**终态快照**（余额/债务/净头寸/剩余可借额度）。
+
 ## 一条命令启动
 
 需要已安装 Docker（含 Compose 插件）。在本目录执行：
@@ -48,6 +50,7 @@ docker compose up --build
 | 排队试算接口 | http://localhost:8000/queue-simulate （POST） |
 | 滑动窗口试算接口 | http://localhost:8000/window-simulate （POST） |
 | 周期结转试算接口 | http://localhost:8000/rollover-simulate （POST） |
+| 借贷令牌桶试算接口 | http://localhost:8000/debt-simulate （POST） |
 | Swagger 交互文档 | http://localhost:8000/docs |
 | ReDoc 文档 | http://localhost:8000/redoc |
 
@@ -1143,6 +1146,131 @@ docker compose up --build
 - r5：同刻只引用 `p10`，可用 8 ≥ 7 → base 8→1；
 - 终态观察时刻 t=10：`p10` 在周期 1（区间 `[10,20)`）base=1、carry=0；`p7` 在周期 1（区间 `[7,14)`）base=2、carry=0。
 
+## 请求格式 `POST /debt-simulate`
+
+给定带**累计债务上限** `debt_limit` 的可借贷令牌桶与一条 `cost` / `chain` 请求序列。与 `/simulate` 一样按时间顺序连续补充，但补充量**先还债**、余额不足时允许在债务上限内**借入缺口**。
+
+```json
+{
+  "buckets": [
+    {"id": "api", "capacity": 10, "refill_rate": 1, "initial": 10, "debt_limit": 5},
+    {"id": "db", "capacity": 8, "refill_rate": 2, "initial": 8, "debt_limit": 4}
+  ],
+  "requests": [
+    {"id": "r1", "timestamp": 0, "cost": 10, "chain": ["api", "db"]},
+    {"id": "r2", "timestamp": 1, "cost": 3, "chain": ["api"]},
+    {"id": "r3", "timestamp": 2, "cost": 2, "chain": ["db"]},
+    {"id": "r4", "timestamp": 3, "cost": 2, "chain": ["api"]},
+    {"id": "r5", "timestamp": 4, "cost": 13, "chain": ["api", "db"]},
+    {"id": "r6", "timestamp": 5, "cost": 13, "chain": ["db"]}
+  ]
+}
+```
+
+### 字段说明
+
+**桶 `buckets[]`**
+
+| 字段 | 必填 | 说明 |
+| --- | --- | --- |
+| `id` | 是 | 桶唯一标识，非空字符串 |
+| `capacity` | 是 | 桶容量（**可用余额**上限），必须 > 0 |
+| `refill_rate` | 是 | 连续补充速率（令牌/秒），必须 ≥ 0 |
+| `initial` | 否 | 初始**可用余额**，默认等于 `capacity`；要求 0 ≤ initial ≤ capacity。初始债务恒为 0 |
+| `debt_limit` | 是 | 累计债务上限，必须为非负有限数值；`0` 表示完全禁止借贷（退化为余额不足即拒） |
+
+**请求 `requests[]`**：与 `/simulate` 完全相同——`id` / `timestamp` / `cost`（必须 > 0）/ `chain`（至少 1 个桶、链内不可重复）。
+
+### 借贷语义
+
+1. **双账本状态**：每个桶维护可用余额 `balance`（0 ≤ balance ≤ capacity）与累计债务 `debt`（0 ≤ debt ≤ debt_limit）；任意时刻二者至少一个为 0——有未偿债务时余额必为 0，余额为正时必无债务。
+2. **时间顺序**：与 `/simulate` 一致——按 `timestamp` 升序处理，同一时刻按输入数组顺序处理；`results` 仍按原始数组顺序返回（含 `index`）。
+3. **补充先还债**：每次判定先对链上所有桶按 `(当前时间 - 上次更新时间) × refill_rate` 连续补充；若桶有债务，补充的令牌**先偿还债务**（`debt` 下降），还清之后的剩余才进入可用余额（封顶 `capacity`）。无论请求最终是否放行，时间都会推进、还债都会发生。
+4. **借贷扣减**：补充后若 `balance >= cost` 则正常扣减；否则借入缺口——`balance` 扣到 0、`debt += cost - balance`。放行条件为补充后的累计债务（含本次借入）**不超过** `debt_limit`。
+5. **永远不可达**：`cost > capacity + debt_limit` 的请求即使在满桶零债时也支付不起，对该桶永远不可达，原因为 `cost_exceeds_capacity`（零补充桶尤其如此——等待不会带来任何偿还或新增额度）。
+6. **链上原子**：按链顺序找第一个无法满足成本的桶；结构不可达（`cost_exceeds_capacity`）优先于当前借贷额度不足（`debt_limit_exceeded`）判定。任一桶失败即整笔拒绝，链上**所有桶的余额与债务保持不变**（补充还债作为时间推进照常发生）。
+7. **拒绝明细** `rejection`：`reason` 标明两种原因之一，并给出判定时刻 `balance_before` / `debt_before`、`debt_limit`、可立即支付总额 `available = balance_before + (debt_limit - debt_before)`、本次需借入缺口 `borrowed` 与超上限缺口 `shortage = cost - available`。
+8. **终态快照** `buckets[]`：以**最后一个请求的时间戳**为观察时刻，逐桶（按 `buckets` 输入顺序）给出 `balance` / `debt`、净头寸 `net = balance - debt`、剩余可借额度 `debt_headroom = debt_limit - debt` 与可立即支付总额 `available = balance + debt_headroom`。
+
+### 响应示例
+
+```json
+{
+  "allowed_count": 4,
+  "rejected_count": 2,
+  "results": [
+    {
+      "request_id": "r1", "index": 0, "timestamp": 0.0, "cost": 10.0,
+      "allowed": true, "rejected_by": null, "rejection": null,
+      "buckets": {
+        "api": {"balance": {"before": 10.0, "after": 0.0}, "debt": {"before": 0.0, "after": 0.0}},
+        "db":  {"balance": {"before": 8.0, "after": 0.0}, "debt": {"before": 0.0, "after": 2.0}}
+      }
+    },
+    {
+      "request_id": "r2", "index": 1, "timestamp": 1.0, "cost": 3.0,
+      "allowed": true, "rejected_by": null, "rejection": null,
+      "buckets": {
+        "api": {"balance": {"before": 1.0, "after": 0.0}, "debt": {"before": 0.0, "after": 2.0}}
+      }
+    },
+    {
+      "request_id": "r3", "index": 2, "timestamp": 2.0, "cost": 2.0,
+      "allowed": true, "rejected_by": null, "rejection": null,
+      "buckets": {
+        "db": {"balance": {"before": 2.0, "after": 0.0}, "debt": {"before": 0.0, "after": 0.0}}
+      }
+    },
+    {
+      "request_id": "r4", "index": 3, "timestamp": 3.0, "cost": 2.0,
+      "allowed": true, "rejected_by": null, "rejection": null,
+      "buckets": {
+        "api": {"balance": {"before": 0.0, "after": 0.0}, "debt": {"before": 0.0, "after": 2.0}}
+      }
+    },
+    {
+      "request_id": "r5", "index": 4, "timestamp": 4.0, "cost": 13.0,
+      "allowed": false, "rejected_by": "api",
+      "rejection": {
+        "bucket_id": "api", "reason": "debt_limit_exceeded",
+        "cost": 13.0, "balance_before": 0.0, "debt_before": 1.0, "debt_limit": 5.0,
+        "available": 4.0, "borrowed": 13.0, "shortage": 9.0
+      },
+      "buckets": {
+        "api": {"balance": {"before": 0.0, "after": 0.0}, "debt": {"before": 1.0, "after": 1.0}},
+        "db":  {"balance": {"before": 4.0, "after": 4.0}, "debt": {"before": 0.0, "after": 0.0}}
+      }
+    },
+    {
+      "request_id": "r6", "index": 5, "timestamp": 5.0, "cost": 13.0,
+      "allowed": false, "rejected_by": "db",
+      "rejection": {
+        "bucket_id": "db", "reason": "cost_exceeds_capacity",
+        "cost": 13.0, "balance_before": 6.0, "debt_before": 0.0, "debt_limit": 4.0,
+        "available": 10.0, "borrowed": 7.0, "shortage": 3.0
+      },
+      "buckets": {
+        "db": {"balance": {"before": 6.0, "after": 6.0}, "debt": {"before": 0.0, "after": 0.0}}
+      }
+    }
+  ],
+  "buckets": [
+    {"id": "api", "capacity": 10.0, "refill_rate": 1.0, "debt_limit": 5.0,
+     "balance": 0.0, "debt": 0.0, "net": 0.0, "debt_headroom": 5.0, "available": 5.0},
+    {"id": "db", "capacity": 8.0, "refill_rate": 2.0, "debt_limit": 4.0,
+     "balance": 6.0, "debt": 0.0, "net": 6.0, "debt_headroom": 4.0, "available": 10.0}
+  ]
+}
+```
+
+- r1：`api` 余额 10 恰好支付；`db` 余额 8 不足，借入缺口 2（`debt` 0→2，在上限 4 内）→ 整笔链放行；
+- r2（t=1）：`api` 补 1（余额 1），cost 3 再借 2 → `debt` 0→2；
+- r3（t=2）：`db` 以 2/s 补 4，先还债 2、剩余 2 进入余额，恰好支付 cost 2 → `debt` 清零、余额 0；
+- r4（t=3）：`api` 自 t=1 起补充 2 个令牌，先还清债务 2，余额仍为 0，cost 2 全部借入 → `debt` 0→2；
+- r5（t=4）：`api` 再补 1 个令牌把债务降到 1、余额仍为 0，可立即支付 `0 + (5-1) = 4 < 13` → `debt_limit_exceeded`，整笔原子拒绝（`db` 此刻余额 4，也保持不变；注意 `db` 结构上限为 8+4=12 < 13 同样不可达，但链顺序先撞 `api`）；
+- r6（t=5）：只引用 `db`，其补充到余额 6；`cost 13 > capacity 8 + debt_limit 4 = 12` → `cost_exceeds_capacity`，永远不可达；
+- 终态观察时刻 t=5：`api` 再补 1 还清最后 1 单位债务（balance 0、debt 0，剩余可借 5）；`db` 余额 6、无债务（剩余可借 4，可立即支付 10）。
+
 ## 校验规则（HTTP 422）
 
 以下非法输入都会被拒绝，错误体统一为 `{"detail": [ {"type", "loc", "msg", ...}, ... ]}`：
@@ -1157,9 +1285,10 @@ docker compose up --build
 - **非法 deadline**（仅 `/queue-simulate`）：`deadline` 缺失、非有限数值或早于 `timestamp`；
 - **非法滑动窗口策略/请求**（仅 `/window-simulate`）：`policies[].id` 重复（`duplicate_policy`）；`window_seconds` / `limit` 缺失、非有限数值或 `<= 0`；`policy_refs` 引用未定义策略（`unknown_policy_ref`）、为空或在同一请求内重复；`principal` 缺失或不是非空字符串；请求 ID 重复（`duplicate_request`）；
 - **非法周期结转策略/请求**（仅 `/rollover-simulate`）：`policies[].id` 重复（`duplicate_policy`）；`anchor` 非有限数值（允许负数）；`period_seconds` / `allowance` 缺失、非有限数值或 `<= 0`；`carry_cap` 缺失、非有限数值或 `< 0`；`policy_refs` 引用未定义策略（`unknown_policy_ref`）、为空或在同一请求内重复；请求 ID 重复（`duplicate_request`）；
-- 此外还校验：链为空、链内桶重复、`cost <= 0`、请求 ID 重复（`duplicate_request`，仅 `/simulate` 系接口、`/route-simulate` 与 `/queue-simulate`）、多余字段（`extra="forbid"`）。
+- **非法借贷桶**（仅 `/debt-simulate`）：`debt_limit` 缺失、非有限数值或 `< 0`（`0` 合法，表示禁止借贷）；桶与请求的其余字段、跨字段校验（重复桶、未知引用、重复请求 ID）与 `/simulate` 一致；
+- 此外还校验：链为空、链内桶重复、`cost <= 0`、请求 ID 重复（`duplicate_request`，仅 `/simulate` 系接口、`/route-simulate`、`/queue-simulate` 与 `/debt-simulate`）、多余字段（`extra="forbid"`）。
 
-以上规则对 `/simulate`、`/forecast`、`/plan-initial-balances`、`/usage-report`、`/fairness-report`、`/reservation-simulate`、`/route-simulate`、`/queue-simulate`、`/window-simulate` 与 `/rollover-simulate` 同时生效（按各自字段；`/plan-initial-balances`、`/usage-report` 与 `/fairness-report` 复用 `/simulate` 的桶与请求跨字段校验；`/reservation-simulate` 使用独立的容量桶模型；`/route-simulate` 复用 `/simulate` 的桶模型并对每条候选链做引用校验；`/queue-simulate` 复用 `/simulate` 的桶、请求字段与跨字段校验，并在请求上增加 `deadline` 校验；`/window-simulate` 使用独立的滑动窗口策略模型，按主体记账并对 `policy_refs` 做引用校验；`/rollover-simulate` 使用独立的周期结转策略模型，对 `policy_refs` 做引用校验，不按主体隔离）。
+以上规则对 `/simulate`、`/forecast`、`/plan-initial-balances`、`/usage-report`、`/fairness-report`、`/reservation-simulate`、`/route-simulate`、`/queue-simulate`、`/window-simulate`、`/rollover-simulate` 与 `/debt-simulate` 同时生效（按各自字段；`/plan-initial-balances`、`/usage-report` 与 `/fairness-report` 复用 `/simulate` 的桶与请求跨字段校验；`/reservation-simulate` 使用独立的容量桶模型；`/route-simulate` 复用 `/simulate` 的桶模型并对每条候选链做引用校验；`/queue-simulate` 复用 `/simulate` 的桶、请求字段与跨字段校验，并在请求上增加 `deadline` 校验；`/window-simulate` 使用独立的滑动窗口策略模型，按主体记账并对 `policy_refs` 做引用校验；`/rollover-simulate` 使用独立的周期结转策略模型，对 `policy_refs` 做引用校验，不按主体隔离；`/debt-simulate` 在 `/simulate` 桶模型上增加必填、非负的 `debt_limit`，请求模型与跨字段校验完全复用）。
 
 ## 本地调用示例
 
@@ -1203,6 +1332,10 @@ curl -X POST http://localhost:8000/window-simulate \
 curl -X POST http://localhost:8000/rollover-simulate \
   -H 'Content-Type: application/json' \
   -d @examples/rollover-simulate.json
+
+curl -X POST http://localhost:8000/debt-simulate \
+  -H 'Content-Type: application/json' \
+  -d @examples/debt-simulate.json
 ```
 
 ## 不使用 Docker 的本地开发（可选）
@@ -1236,6 +1369,7 @@ pytest -q
 │   ├── queueing.py      # 严格 FIFO 排队试算引擎（队首等待至可执行时刻或 deadline）
 │   ├── windowing.py     # 半开滑动窗口试算引擎（多策略/多主体链上原子记账）
 │   ├── rollover.py      # 周期结转额度试算引擎（跨期失效/结转、先扣结转额的链上原子扣减）
+│   ├── debt.py          # 可借贷令牌桶试算引擎（补充先还债、上限内借入的链上原子扣减）
 │   └── errors.py        # 跨字段校验错误类型
 ├── tests/               # pytest 测试（引擎语义 + HTTP）
 ├── examples/request.json
@@ -1248,6 +1382,7 @@ pytest -q
 ├── examples/queue-simulate.json
 ├── examples/window-simulate.json
 ├── examples/rollover-simulate.json
+├── examples/debt-simulate.json
 ├── requirements.txt
 ├── Dockerfile           # 依赖安装在镜像构建阶段完成
 ├── docker-compose.yml   # 单命令启动，映射 8000 端口

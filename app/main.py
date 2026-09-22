@@ -7,9 +7,12 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 
 from app.errors import RequestValidationErrors
+from app.debt import debt_simulate
 from app.fairness import fairness_report
 from app.forecast import forecast
 from app.models import (
+    DebtSimulateRequest,
+    DebtSimulateResponse,
     FairnessReportRequest,
     FairnessReportResponse,
     ForecastRequest,
@@ -69,6 +72,12 @@ app = FastAPI(
         "上期未用基础额度按 carry_cap 上限结转到新周期，消费先扣即将失效的结转额再扣本期额度，"
         "仅当全部引用策略两类余额合计都足够时原子扣减，否则全部不变并返回首个不足策略；"
         "响应按原始顺序给出周期编号、两类余额扣减前后快照、拒绝原因与各策略终态。"
+        "以及 /debt-simulate：给定带 capacity、refill_rate、initial、debt_limit 的"
+        "可借贷令牌桶与按 timestamp 排序的 cost/chain 请求；每次判定先连续补充，"
+        "补充量先偿还债务、剩余才进入可用余额，余额不足时允许借入缺口但累计债务"
+        "不得超过 debt_limit，cost 超过 capacity + debt_limit 的请求永远不可达；"
+        "链上任一桶无法在借贷上限内满足成本则整笔原子拒绝。响应按原始索引返回 "
+        "allowed、每桶 before/after 的 balance 与 debt、rejected_by/reason 及终态快照。"
     ),
     version="1.0.0",
 )
@@ -101,6 +110,7 @@ def root():
         "queue_simulate": "/queue-simulate",
         "window_simulate": "/window-simulate",
         "rollover_simulate": "/rollover-simulate",
+        "debt_simulate": "/debt-simulate",
     }
 
 
@@ -179,3 +189,12 @@ def window_simulate_endpoint(payload: WindowSimulateRequest) -> WindowSimulateRe
 )
 def rollover_simulate_endpoint(payload: RolloverSimulateRequest) -> RolloverSimulateResponse:
     return rollover_simulate(payload)
+
+
+@app.post(
+    "/debt-simulate",
+    response_model=DebtSimulateResponse,
+    tags=["debt"],
+)
+def debt_simulate_endpoint(payload: DebtSimulateRequest) -> DebtSimulateResponse:
+    return debt_simulate(payload)

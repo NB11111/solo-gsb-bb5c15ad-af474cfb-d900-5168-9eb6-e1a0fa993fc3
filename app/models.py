@@ -1588,3 +1588,168 @@ class RolloverSimulateResponse(BaseModel):
         list[RolloverPolicyFinalState],
         Field(description="各策略在最后请求时刻的终态，按 policies 输入顺序"),
     ]
+
+
+# ---------- 借贷令牌桶试算 (/debt-simulate) ----------
+
+
+class DebtBucketSpec(BaseModel):
+    """可借贷令牌桶定义。
+
+    余额不足时允许借入缺口形成债务 debt，但累计债务不得超过 debt_limit；
+    连续补充的令牌先偿还债务，剩余部分才进入可用余额。
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    id: Annotated[str, Field(min_length=1, description="桶唯一标识")]
+    capacity: Annotated[float, Field(description="桶容量（可用余额上限），必须为正数")]
+    refill_rate: Annotated[float, Field(description="令牌补充速率（令牌/秒），必须非负")]
+    initial: Annotated[float | None, Field(default=None, description="初始余额，默认等于容量")] = None
+    debt_limit: Annotated[
+        float, Field(description="累计债务上限，必须为非负有限数值；0 表示禁止借贷")
+    ]
+
+    @field_validator("capacity", "refill_rate", mode="after")
+    @classmethod
+    def _validate_rate_fields(cls, value, info):
+        if info.field_name == "capacity" and value <= 0:
+            raise ValueError("capacity 必须为正数")
+        if info.field_name == "refill_rate" and value < 0:
+            raise ValueError("refill_rate 必须为非负数")
+        return value
+
+    @field_validator("initial", mode="before")
+    @classmethod
+    def _validate_initial(cls, value):
+        if value is not None and (not _is_finite_number(value) or value < 0):
+            raise ValueError("initial 必须是非负有限数值")
+        return value
+
+    @field_validator("debt_limit", mode="before")
+    @classmethod
+    def _validate_debt_limit(cls, value):
+        if not _is_finite_number(value):
+            raise ValueError("debt_limit 必须是有限数值")
+        if value < 0:
+            raise ValueError("debt_limit 必须为非负数")
+        return value
+
+    @model_validator(mode="after")
+    def _check_initial_within_capacity(self):
+        if self.initial is not None and self.initial > self.capacity + EPS:
+            raise ValueError("initial 不能大于 capacity")
+        return self
+
+
+class DebtSimulateRequest(BaseModel):
+    """POST /debt-simulate 请求体。"""
+
+    model_config = ConfigDict(extra="forbid")
+
+    buckets: Annotated[list[DebtBucketSpec], Field(min_length=1, description="可借贷令牌桶集合")]
+    requests: Annotated[
+        list[SimRequest], Field(min_length=1, description="按时间戳模拟的请求序列")
+    ]
+
+    @model_validator(mode="after")
+    def _cross_validate(self):
+        errors = _simulate_cross_validation_errors(self.buckets, self.requests)
+        if errors:
+            raise RequestValidationErrors(errors)
+        return self
+
+
+class DebtBalance(BaseModel):
+    """某桶在一次请求判定时可用余额与债务的扣减前后视图。"""
+
+    balance: Annotated[
+        BucketBalance, Field(description="可用余额：补充还债之后、本次判定之前/之后")
+    ]
+    debt: Annotated[
+        BucketBalance, Field(description="累计债务：补充还债之后、本次判定之前/之后")
+    ]
+
+
+class DebtRejection(BaseModel):
+    """拒绝原因：借贷上限内无法满足成本的首个桶。"""
+
+    bucket_id: Annotated[str, Field(description="链上首个无法满足成本的桶 ID")]
+    reason: Annotated[
+        Literal["cost_exceeds_capacity", "debt_limit_exceeded"],
+        Field(
+            description=(
+                "拒绝原因：cost_exceeds_capacity=cost 超过 capacity + debt_limit，"
+                "该请求对该桶永远不可达；debt_limit_exceeded=缺口超过该桶剩余可借额度"
+            )
+        ),
+    ]
+    cost: Annotated[float, Field(description="本次请求的消耗量")]
+    balance_before: Annotated[
+        float, Field(description="判定时刻（补充还债之后、扣减之前）的可用余额")
+    ]
+    debt_before: Annotated[
+        float, Field(description="判定时刻（补充还债之后、扣减之前）的累计债务")
+    ]
+    debt_limit: Annotated[float, Field(description="该桶的累计债务上限")]
+    available: Annotated[
+        float,
+        Field(description="判定时刻可用于支付的总额 = 可用余额 + 剩余可借额度"),
+    ]
+    borrowed: Annotated[
+        float, Field(description="本次需要借入的缺口 = cost - 可用余额（无需借贷时为 0）")
+    ]
+    shortage: Annotated[float, Field(description="超出借贷上限的缺口 = cost - available")]
+
+
+class DebtSimResult(BaseModel):
+    """单项请求的借贷桶试算结果。"""
+
+    request_id: str
+    index: Annotated[int, Field(description="该请求在原始 requests 数组中的下标")]
+    timestamp: float
+    cost: float
+    allowed: bool
+    buckets: Annotated[
+        dict[str, DebtBalance],
+        Field(description="链上各桶可用余额与债务的扣减前后视图，按 chain 顺序"),
+    ]
+    rejected_by: Annotated[
+        str | None, Field(default=None, description="首个无法满足成本的桶 ID；放行时为 null")
+    ] = None
+    rejection: Annotated[
+        DebtRejection | None, Field(default=None, description="拒绝原因明细；放行时为 null")
+    ] = None
+
+
+class DebtBucketFinalState(BaseModel):
+    """单个可借贷桶在模拟结束时刻（最后一个请求时间戳）的终态快照。"""
+
+    id: str
+    capacity: Annotated[float, Field(description="桶容量（可用余额上限）")]
+    refill_rate: Annotated[float, Field(description="令牌补充速率（令牌/秒）")]
+    debt_limit: Annotated[float, Field(description="累计债务上限")]
+    balance: Annotated[float, Field(description="终态可用余额")]
+    debt: Annotated[float, Field(description="终态累计债务")]
+    net: Annotated[
+        float, Field(description="净头寸 = balance - debt（为负表示净负债）")
+    ]
+    debt_headroom: Annotated[
+        float, Field(description="剩余可借额度 = debt_limit - debt")
+    ]
+    available: Annotated[
+        float,
+        Field(description="此刻可立即支付的总额 = balance + debt_headroom"),
+    ]
+
+
+class DebtSimulateResponse(BaseModel):
+    allowed_count: int
+    rejected_count: int
+    results: Annotated[
+        list[DebtSimResult], Field(description="逐项请求结果，按原始输入索引升序")
+    ]
+    buckets: Annotated[
+        list[DebtBucketFinalState],
+        Field(description="各桶在最后请求时刻的终态快照，按 buckets 输入顺序"),
+    ]

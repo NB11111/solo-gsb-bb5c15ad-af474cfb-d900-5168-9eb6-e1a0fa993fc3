@@ -1,0 +1,14 @@
+{
+  "buckets": [
+    {"id": "api", "capacity": 10, "refill_rate": 1, "initial": 10, "debt_limit": 5},
+    {"id": "db", "capacity": 8, "refill_rate": 2, "initial": 8, "debt_limit": 4}
+  ],
+  "requests": [
+    {"id": "r1", "timestamp": 0, "cost": 10, "chain": ["api", "db"]},
+    {"id": "r2", "timestamp": 1, "cost": 3, "chain": ["api"]},
+    {"id": "r3", "timestamp": 2, "cost": 2, "chain": ["db"]},
+    {"id": "r4", "timestamp": 3, "cost": 2, "chain": ["api"]},
+    {"id": "r5", "timestamp": 4, "cost": 13, "chain": ["api", "db"]},
+    {"id": "r6", "timestamp": 5, "cost": 13, "chain": ["db"]}
+  ]
+}
